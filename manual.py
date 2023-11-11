@@ -3,20 +3,27 @@ import json
 import logging
 import traceback
 from pydantic import BaseModel
+import base64
 
 from fastapi import FastAPI, WebSocket, HTTPException, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from diffusers import AutoPipelineForImage2Image, AutoencoderTiny
+from diffusers import AutoencoderTiny, ControlNetModel
+from latent_consistency_controlnet import LatentConsistencyModelPipeline_controlnet
 from compel import Compel
 import torch
 
-try:
-    import intel_extension_for_pytorch as ipex
-except:
-    pass
+from canny_gpu import SobelOperator 
+# from controlnet_aux import OpenposeDetector
+# import cv2
+
+# I'm not using Intel Arc, so I don't need this
+#try:
+#    import intel_extension_for_pytorch as ipex
+#except:
+#    pass
 from PIL import Image
 import numpy as np
 import gradio as gr
@@ -26,11 +33,11 @@ import os
 import time
 import psutil
 
+
 MAX_QUEUE_SIZE = int(os.environ.get("MAX_QUEUE_SIZE", 0))
 TIMEOUT = float(os.environ.get("TIMEOUT", 0))
 SAFETY_CHECKER = os.environ.get("SAFETY_CHECKER", None)
 TORCH_COMPILE = os.environ.get("TORCH_COMPILE", None)   
-
 WIDTH = 512
 HEIGHT = 512
 # disable tiny autoencoder for better quality speed tradeoff
@@ -42,10 +49,9 @@ xpu_available = hasattr(torch, "xpu") and torch.xpu.is_available()
 device = torch.device(
     "cuda" if torch.cuda.is_available() else "xpu" if xpu_available else "cpu"
 )
-torch_device = device
 
 # change to torch.float16 to save GPU memory
-torch_dtype = torch.float32
+torch_dtype = torch.float16
 
 print(f"TIMEOUT: {TIMEOUT}")
 print(f"SAFETY_CHECKER: {SAFETY_CHECKER}")
@@ -54,17 +60,36 @@ print(f"device: {device}")
 
 if mps_available:
     device = torch.device("mps")
-    torch_device = "cpu"
+    device = "cpu"
     torch_dtype = torch.float32
 
+controlnet_canny = ControlNetModel.from_pretrained(
+    "lllyasviel/control_v11p_sd15_canny", torch_dtype=torch_dtype
+).to(device)
+
+canny_torch = SobelOperator(device=device)
+# controlnet_pose = ControlNetModel.from_pretrained(
+#     "lllyasviel/control_v11p_sd15_openpose", torch_dtype=torch_dtype
+# ).to(device)
+# controlnet_depth = ControlNetModel.from_pretrained(
+#     "lllyasviel/control_v11f1p_sd15_depth", torch_dtype=torch_dtype
+# ).to(device)
+
+
+# pose_processor = OpenposeDetector.from_pretrained("lllyasviel/ControlNet")
+
 if SAFETY_CHECKER == "True":
-    pipe = AutoPipelineForImage2Image.from_pretrained(
+    pipe = LatentConsistencyModelPipeline_controlnet.from_pretrained(
         "SimianLuo/LCM_Dreamshaper_v7",
+        controlnet=controlnet_canny,
+        scheduler=None,
     )
 else:
-    pipe = AutoPipelineForImage2Image.from_pretrained(
+    pipe = LatentConsistencyModelPipeline_controlnet.from_pretrained(
         "SimianLuo/LCM_Dreamshaper_v7",
         safety_checker=None,
+        controlnet=controlnet_canny,
+        scheduler=None,
     )
 
 if USE_TINY_AUTOENCODER:
@@ -72,23 +97,24 @@ if USE_TINY_AUTOENCODER:
         "madebyollin/taesd", torch_dtype=torch_dtype, use_safetensors=True
     )
 pipe.set_progress_bar_config(disable=True)
-pipe.to(device=torch_device, dtype=torch_dtype).to(device)
+pipe.to(device=device, dtype=torch_dtype).to(device)
 pipe.unet.to(memory_format=torch.channels_last)
 
 if psutil.virtual_memory().total < 64 * 1024**3:
     pipe.enable_attention_slicing()
-
-if TORCH_COMPILE:
-    pipe.unet = torch.compile(pipe.unet, mode="reduce-overhead", fullgraph=True)
-    pipe.vae = torch.compile(pipe.vae, mode="reduce-overhead", fullgraph=True)
-
-    pipe(prompt="warmup", image=[Image.new("RGB", (512, 512))])
 
 compel_proc = Compel(
     tokenizer=pipe.tokenizer,
     text_encoder=pipe.text_encoder,
     truncate_long_prompts=False,
 )
+if TORCH_COMPILE:
+    pipe.unet = torch.compile(pipe.unet, mode="reduce-overhead", fullgraph=True)
+    pipe.vae = torch.compile(pipe.vae, mode="reduce-overhead", fullgraph=True)
+
+    pipe(prompt="warmup", image=[Image.new("RGB", (768, 768))], control_image=[Image.new("RGB", (768, 768))])
+
+
 user_queue_map = {}
 
 
@@ -101,10 +127,21 @@ class InputParams(BaseModel):
     lcm_steps: int = 50
     width: int = WIDTH
     height: int = HEIGHT
+    controlnet_scale: float = 0.8
+    controlnet_start: float = 0.0
+    controlnet_end: float = 1.0
+    canny_low_threshold: float = 0.31
+    canny_high_threshold: float = 0.78
+    debug_canny: bool = False
 
-def predict(input_image: Image.Image, params: InputParams, prompt_embeds: torch.Tensor = None):
+def predict(
+    input_image: Image.Image, params: InputParams, prompt_embeds: torch.Tensor = None
+):
     generator = torch.manual_seed(params.seed)
+    
+    control_image = canny_torch(input_image, params.canny_low_threshold, params.canny_high_threshold)
     results = pipe(
+        control_image=control_image,
         prompt_embeds=prompt_embeds,
         generator=generator,
         image=input_image,
@@ -113,8 +150,11 @@ def predict(input_image: Image.Image, params: InputParams, prompt_embeds: torch.
         guidance_scale=params.guidance_scale,
         width=params.width,
         height=params.height,
-        original_inference_steps=params.lcm_steps,
+        lcm_origin_steps=params.lcm_steps,
         output_type="pil",
+        controlnet_conditioning_scale=params.controlnet_scale,
+        control_guidance_start=params.controlnet_start,
+        control_guidance_end=params.controlnet_end,
     )
     nsfw_content_detected = (
         results.nsfw_content_detected[0]
@@ -123,7 +163,15 @@ def predict(input_image: Image.Image, params: InputParams, prompt_embeds: torch.
     )
     if nsfw_content_detected:
         return None
-    return results.images[0]
+    result_image = results.images[0]
+    if params.debug_canny:
+        # paste control_image on top of result_image
+        w0, h0 = (200, 200)
+        control_image = control_image.resize((w0, h0))
+        w1, h1 = result_image.size
+        result_image.paste(control_image, (w1 - w0, h1 - h0))
+
+    return result_image
 
 
 app = FastAPI()
@@ -147,11 +195,11 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         uid = str(uuid.uuid4())
+        user_queue_map[uid] = {"queue": asyncio.Queue(), "websocket": websocket}
         print(f"New user connected: {uid}")
         await websocket.send_json(
             {"status": "success", "message": "Connected", "userId": uid}
         )
-        user_queue_map[uid] = {"queue": asyncio.Queue()}
         await websocket.send_json(
             {"status": "start", "message": "Start Streaming", "userId": uid}
         )
@@ -190,6 +238,7 @@ async def stream(user_id: uuid.UUID):
             while True:
                 data = await queue.get()
                 input_image = data["image"]
+                print("new image")
                 params = data["params"]
                 if input_image is None:
                     continue
@@ -199,11 +248,13 @@ async def stream(user_id: uuid.UUID):
                     prompt_embeds = compel_proc(params.prompt)
                     last_prompt = params.prompt
 
+                start_time = time.time()
                 image = predict(
                     input_image,
                     params,
                     prompt_embeds,
                 )
+                print(f"Time: {time.time() - start_time}")
                 if image is None:
                     continue
                 frame_data = io.BytesIO()
@@ -212,6 +263,12 @@ async def stream(user_id: uuid.UUID):
                 if frame_data is not None and len(frame_data) > 0:
                     yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame_data + b"\r\n"
 
+                    # convert the frame to base64 and send it as a json object
+                    base64_bytes = base64.b64encode(frame_data)
+                    base64_string = base64_bytes.decode("utf-8")
+                    await user_queue_map[uid]['websocket'].send_json({"image": base64_string})
+                    
+                    await user_queue_map[uid]['websocket'].send_json({"status": "imageProcessed"})
                 await asyncio.sleep(1.0 / 120.0)
 
         return StreamingResponse(
@@ -259,4 +316,4 @@ async def handle_websocket_data(websocket: WebSocket, user_id: uuid.UUID):
         traceback.print_exc()
 
 
-app.mount("/", StaticFiles(directory="img2img", html=True), name="public")
+app.mount("/", StaticFiles(directory="manual", html=True), name="public")

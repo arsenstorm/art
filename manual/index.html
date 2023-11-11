@@ -3,7 +3,9 @@
 
 <head>
     <meta charset="UTF-8">
-    <title>Real-Time Latent Consistency Model</title>
+    <title>
+        Manual Art Mode
+    </title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <script
         src="https://cdnjs.cloudflare.com/ajax/libs/iframe-resizer/4.3.1/iframeResizer.contentWindow.min.js"></script>
@@ -15,15 +17,16 @@
         }
     </style>
     <script type="module">
+        let image_processing = false;
         const getValue = (id) => {
             const el = document.querySelector(`${id}`)
             if (el.type === "checkbox")
                 return el.checked;
             return el.value;
         }
-
-        const startBtn = document.querySelector("#start");
-        const stopBtn = document.querySelector("#stop");
+        //const startBtn = document.querySelector("#start");
+        //const stopBtn = document.querySelector("#stop");
+        const sendBtn = document.querySelector("#send");
         const videoEl = document.querySelector("#webcam");
         const imageEl = document.querySelector("#player");
         const queueSizeEl = document.querySelector("#queue_size");
@@ -54,20 +57,30 @@
                     };
                     socket.onmessage = (event) => {
                         const data = JSON.parse(event.data);
+                        if (data.image) {
+                            imageEl.src = `data:image/jpeg;base64,${data.image}`;
+                        }
                         switch (data.status) {
                             case "success":
+                                // Handle success case
                                 break;
                             case "start":
                                 const userId = data.userId;
                                 initVideoStream(userId);
                                 break;
+                            case "imageProcessed":
+                                // This is the new case for when the image has been processed
+                                image_processing = false;
+                                stop();
+                                break;
                             case "timeout":
                                 stop();
                                 resolve({ "status": "timeout" });
+                                break;
                             case "error":
                                 stop();
                                 reject(data.message);
-
+                                break;
                         }
                     };
                     websocket = socket;
@@ -115,6 +128,12 @@
                     "lcm_steps": getValue("#lcm_steps"),
                     "width": WIDTH,
                     "height": HEIGHT,
+                    "controlnet_scale": getValue("#controlnet_scale"),
+                    "controlnet_start": getValue("#controlnet_start"),
+                    "controlnet_end": getValue("#controlnet_end"),
+                    "canny_low_threshold": getValue("#canny_low_threshold"),
+                    "canny_high_threshold": getValue("#canny_high_threshold"),
+                    "debug_canny": getValue("#debug_canny")
                 }));
             }
             let mediaDevices = [];
@@ -137,6 +156,7 @@
                     .catch(err => {
                         console.error(err);
                     });
+
                 const constraints = {
                     audio: false,
                     video: { width: 1024, height: 1024, deviceId: mediaDevices[0].deviceId }
@@ -145,9 +165,9 @@
                     .getUserMedia(constraints)
                     .then((mediaStream) => {
                         webcamVideo.srcObject = mediaStream;
-                        webcamVideo.onloadedmetadata = () => {
+                        webcamVideo.onloadedmetadata = async () => {
                             webcamVideo.play();
-                            webcamVideo.addEventListener("timeupdate", videoTimeUpdateHandler);
+                            await sendFrame(); // Capture and send the frame immediately
                         };
                     })
                     .catch((err) => {
@@ -155,8 +175,46 @@
                     });
             }
 
+            async function sendFrame() {
+                image_processing = true;
+                const dimension = getValue("input[name=dimension]:checked");
+                const [WIDTH, HEIGHT] = JSON.parse(dimension);
+
+                const canvas = new OffscreenCanvas(WIDTH, HEIGHT);
+                const videoW = webcamVideo.videoWidth;
+                const videoH = webcamVideo.videoHeight;
+                const aspectRatio = WIDTH / HEIGHT;
+
+                const ctx = canvas.getContext("2d");
+                ctx.drawImage(webcamVideo, videoW / 2 - videoH * aspectRatio / 2, 0, videoH * aspectRatio, videoH, 0, 0, WIDTH, HEIGHT);
+                const blob = await canvas.convertToBlob({ type: "image/jpeg", quality: 1 });
+                websocket.send(blob);
+                websocket.send(JSON.stringify({
+                    "seed": getValue("#seed"),
+                    "prompt": getValue("#prompt"),
+                    "guidance_scale": getValue("#guidance-scale"),
+                    "strength": getValue("#strength"),
+                    "steps": getValue("#steps"),
+                    "lcm_steps": getValue("#lcm_steps"),
+                    "width": WIDTH,
+                    "height": HEIGHT,
+                    "controlnet_scale": getValue("#controlnet_scale"),
+                    "controlnet_start": getValue("#controlnet_start"),
+                    "controlnet_end": getValue("#controlnet_end"),
+                    "canny_low_threshold": getValue("#canny_low_threshold"),
+                    "canny_high_threshold": getValue("#canny_high_threshold"),
+                    "debug_canny": getValue("#debug_canny")
+                }));
+            }
+
+
             async function stop() {
-                websocket.close();
+                if (websocket && websocket.readyState === WebSocket.OPEN) {
+                    while (image_processing) {
+                        await new Promise((resolve) => setTimeout(resolve, 100));
+                    }
+                    websocket.close();
+                }
                 navigator.mediaDevices.getUserMedia({ video: true }).then((mediaStream) => {
                     mediaStream.getTracks().forEach((track) => track.stop());
                 });
@@ -191,10 +249,9 @@
                 const zeroth = {};
                 const exif = {};
                 const gps = {};
-                zeroth[piexif.ImageIFD.Make] = "LCM Image-to-Image";
-                zeroth[piexif.ImageIFD.ImageDescription] = `prompt: ${getValue("#prompt")} | seed: ${getValue("#seed")} | guidance_scale: ${getValue("#guidance-scale")} | strength: ${getValue("#strength")} | lcm_steps: ${getValue("#lcm_steps")} | steps: ${getValue("#steps")}`;
+                zeroth[piexif.ImageIFD.Make] = "LCM Image-to-Image ControNet";
+                zeroth[piexif.ImageIFD.ImageDescription] = `prompt: ${getValue("#prompt")} | seed: ${getValue("#seed")} | guidance_scale: ${getValue("#guidance-scale")} | strength: ${getValue("#strength")} | controlnet_start: ${getValue("#controlnet_start")} | controlnet_end: ${getValue("#controlnet_end")} | lcm_steps: ${getValue("#lcm_steps")} | steps: ${getValue("#steps")}`;
                 zeroth[piexif.ImageIFD.Software] = "https://github.com/radames/Real-Time-Latent-Consistency-Model";
-
                 exif[piexif.ExifIFD.DateTimeOriginal] = new Date().toISOString();
 
                 const exifObj = { "0th": zeroth, "Exif": exif, "GPS": gps };
@@ -219,7 +276,7 @@
 
 
         const lcmLive = LCMLive(videoEl, imageEl);
-        startBtn.addEventListener("click", async () => {
+        /*startBtn.addEventListener("click", async () => {
             try {
                 startBtn.disabled = true;
                 snapBtn.disabled = false;
@@ -232,10 +289,24 @@
                 toggleMessage("error")
                 startBtn.disabled = false;
             }
+        });*/
+        sendBtn.addEventListener("click", async () => {
+            try {
+                sendBtn.disabled = true;
+                snapBtn.disabled = false;
+                const res = await lcmLive.start();
+                sendBtn.disabled = false;
+                if (res.status === "timeout")
+                    toggleMessage("success")
+            } catch (err) {
+                console.log(err);
+                toggleMessage("error")
+                sendBtn.disabled = false;
+            }
         });
-        stopBtn.addEventListener("click", () => {
+        /*stopBtn.addEventListener("click", () => {
             lcmLive.stop();
-        });
+        });*/
         window.addEventListener("beforeunload", () => {
             lcmLive.stop();
         });
@@ -244,7 +315,8 @@
             fetch("/queue_size")
                 .then((res) => res.json())
                 .then((data) => {
-                    queueSizeEl.innerText = data.queue_size;
+                    //queueSizeEl.innerText = data.queue_size;
+                    console.log("some data")
                 })
                 .catch((err) => {
                     console.log(err);
@@ -258,24 +330,7 @@
     </div>
     <main class="container mx-auto px-4 py-4 max-w-4xl flex flex-col gap-4">
         <article class="text-center max-w-xl mx-auto">
-            <h1 class="text-3xl font-bold">Real-Time Latent Consistency Model</h1>
-            <h2 class="text-2xl font-bold mb-4">Image to Image</h2>
-            <p class="text-sm">
-                This demo showcases
-                <a href="https://huggingface.co/SimianLuo/LCM_Dreamshaper_v7" target="_blank"
-                    class="text-blue-500 underline hover:no-underline">LCM</a> Image to Image pipeline
-                using
-                <a href="https://github.com/huggingface/diffusers/tree/main/examples/community#latent-consistency-pipeline"
-                    target="_blank" class="text-blue-500 underline hover:no-underline">Diffusers</a> with a MJPEG
-                stream server.
-            </p>
-            <p class="text-sm">
-                There are <span id="queue_size" class="font-bold">0</span> user(s) sharing the same GPU, affecting
-                real-time performance. Maximum queue size is 4. <a
-                    href="https://huggingface.co/spaces/radames/Real-Time-Latent-Consistency-Model?duplicate=true"
-                    target="_blank" class="text-blue-500 underline hover:no-underline">Duplicate</a> and run it on your
-                own GPU.
-            </p>
+            <h1 class="text-3xl font-bold">Art Maker Boo</h1>
         </article>
         <div>
             <h2 class="font-medium">Prompt</h2>
@@ -287,9 +342,8 @@
             <div class="flex text-normal px-1 py-1 border border-gray-700 rounded-md items-center">
                 <textarea type="text" id="prompt" class="font-light w-full px-3 py-2 mx-1  outline-none dark:text-black"
                     title="Prompt, this is an example, feel free to modify"
-                    placeholder="Add your prompt here...">Portrait of The Terminator with , glare pose, detailed, intricate, full of colour, cinematic lighting, trending on artstation, 8k, hyperrealistic, focused, extreme details, unreal engine 5, cinematic, masterpiece</textarea>
+                    placeholder="Add your prompt here...">Portrait of a pretty girl, glare pose, detailed, intricate, full of colour, cinematic lighting, trending on artstation, 8k, hyperrealistic, focused, extreme details, unreal engine 5, cinematic, masterpiece</textarea>
             </div>
-
         </div>
         <div class="">
             <details>
@@ -326,6 +380,38 @@
                     <output class="text-xs w-[50px] text-center font-light px-1 py-1 border border-gray-700 rounded-md">
                         0.5</output>
                     <!--  -->
+                    <label class="text-sm font-medium" for="controlnet_scale">ControlNet Condition Scale</label>
+                    <input type="range" id="controlnet_scale" name="controlnet_scale" min="0.0" max="1" step="0.001"
+                        value="0.80" oninput="this.nextElementSibling.value = Number(this.value).toFixed(2)">
+                    <output class="text-xs w-[50px] text-center font-light px-1 py-1 border border-gray-700 rounded-md">
+                        0.8</output>
+                    <!--  -->
+                    <label class="text-sm font-medium" for="controlnet_start">ControlNet Guidance Start</label>
+                    <input type="range" id="controlnet_start" name="controlnet_start" min="0.0" max="1.0" step="0.001"
+                        value="0.0" oninput="this.nextElementSibling.value = Number(this.value).toFixed(2)">
+                    <output class="text-xs w-[50px] text-center font-light px-1 py-1 border border-gray-700 rounded-md">
+                        0.0</output>
+                    <!--  -->
+                    <label class="text-sm font-medium" for="controlnet_end">ControlNet Guidance End</label>
+                    <input type="range" id="controlnet_end" name="controlnet_end" min="0.0" max="1.0" step="0.001"
+                        value="1.0" oninput="this.nextElementSibling.value = Number(this.value).toFixed(2)">
+                    <output class="text-xs w-[50px] text-center font-light px-1 py-1 border border-gray-700 rounded-md">
+                        1.0</output>
+                    <!--  -->
+                    <label class="text-sm font-medium" for="canny_low_threshold">Canny Low Threshold</label>
+                    <input type="range" id="canny_low_threshold" name="canny_low_threshold" min="0.0" max="1.0"
+                        step="0.001" value="0.1"
+                        oninput="this.nextElementSibling.value = Number(this.value).toFixed(2)">
+                    <output class="text-xs w-[50px] text-center font-light px-1 py-1 border border-gray-700 rounded-md">
+                        0.1</output>
+                    <!--  -->
+                    <label class="text-sm font-medium" for="canny_high_threshold">Canny High Threshold</label>
+                    <input type="range" id="canny_high_threshold" name="canny_high_threshold" min="0.0" max="1.0"
+                        step="0.001" value="0.2"
+                        oninput="this.nextElementSibling.value = Number(this.value).toFixed(2)">
+                    <output class="text-xs w-[50px] text-center font-light px-1 py-1 border border-gray-700 rounded-md">
+                        0.2</output>
+                    <!--  -->
                     <label class="text-sm font-medium" for="seed">Seed</label>
                     <input type="number" id="seed" name="seed" value="299792458"
                         class="font-light border border-gray-700 text-right rounded-md p-2 dark:text-black">
@@ -348,34 +434,52 @@
                                 lass="cursor-pointer">
                             <label for="dimension768" class="text-sm cursor-pointer">768x768</label>
                         </div>
+                        <div class="flex gap-1">
+                            <input type="radio" id="dimension1024" name="dimension" value="[1024,1024]"
+                                lass="cursor-pointer">
+                            <label for="dimension1024" class="text-sm cursor-pointer">1024x1024</label>
+                        </div>
+                        <div class="flex gap-1">
+                            <input type="radio" id="dimension2048" name="dimension" value="[2048,2048]"
+                                lass="cursor-pointer">
+                            <label for="dimension2048" class="text-sm cursor-pointer">2048x2048</label>
+                        </div>
                     </div>
+                    <!--  -->
+                    <!--  -->
+                    <label class="text-sm font-medium" for="debug_canny">Debug Canny</label>
+                    <div class="col-span-2 flex gap-2">
+                        <input type="checkbox" id="debug_canny" name="debug_canny" class="cursor-pointer">
+                        <label for="debug_canny" class="text-sm cursor-pointer"></label>
+                    </div>
+                    <div></div>
                     <!--  -->
                 </div>
             </details>
         </div>
         <div class="flex gap-3">
-            <button id="start" class="button">
-                Start
-            </button>
-            <button id="stop" class="button">
-                Stop
+            <button id="send" class="button">
+                Send
             </button>
             <button id="snap" disabled class="button ml-auto">
                 Snapshot
             </button>
         </div>
+        <div class="fixed left-0 top-0">
+            <video id="webcam" class="max-w-[250px] w-full aspect-square relative z-10 object-cover border" playsinline
+                autoplay muted loop>
+            </video>
+        </div>
         <div class="relative rounded-lg border border-slate-300 overflow-hidden">
-            <img id="player" class="w-full aspect-square rounded-lg "
+            <img id="player" class="w-full aspect-square rounded-lg"
                 src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=">
-            <div class="absolute top-0 left-0 w-1/4 aspect-square">
-                <video id="webcam" class="w-full aspect-square relative z-10 object-cover" playsinline autoplay muted
-                    loop></video>
+            <!--<div class="absolute top-0 left-0 w-1/4 aspect-square">
                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 448" width="100"
                     class="w-full p-4 absolute top-0 opacity-20 z-0">
                     <path fill="currentColor"
                         d="M224 256a128 128 0 1 0 0-256 128 128 0 1 0 0 256zm-45.7 48A178.3 178.3 0 0 0 0 482.3 29.7 29.7 0 0 0 29.7 512h388.6a29.7 29.7 0 0 0 29.7-29.7c0-98.5-79.8-178.3-178.3-178.3h-91.4z" />
                 </svg>
-            </div>
+            </div>-->
         </div>
     </main>
 </body>
