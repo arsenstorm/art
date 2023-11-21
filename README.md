@@ -28,22 +28,7 @@ You need CUDA and Python 3.10, Mac with an M1/M2/M3 chip or Intel Arc GPU
 python -m venv venv
 source venv/bin/activate
 pip3 install -r requirements.txt
-uvicorn "app-img2img:app" --host 0.0.0.0 --port 7860 --reload
-```
-
-### text to image
-
-```bash
-python -m venv venv
-source venv/bin/activate
-pip3 install -r requirements.txt
-uvicorn "app-txt2img:app" --host 0.0.0.0 --port 7860 --reload
-```
-
-or with environment variables
-
-```bash
-TIMEOUT=120 SAFETY_CHECKER=True MAX_QUEUE_SIZE=4 uvicorn "app-img2img:app" --host 0.0.0.0 --port 7860 --reload
+uvicorn "manual:app" --host 0.0.0.0 --port 7860 --reload
 ```
 
 If you're running locally and want to test it on Mobile Safari, the webserver needs to be served over HTTPS.
